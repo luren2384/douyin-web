@@ -28,11 +28,15 @@ export default function VideoToTextPage() {
   async function transcribeOne(video: SavedVideo): Promise<boolean> {
     setTranscribingIds((prev) => new Set(prev).add(video.aweme_id));
     try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 600000); // 10 分钟超时
       const resp = await fetch("/api/transcribe", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ video_url: video.video_url }),
+        signal: controller.signal,
       });
+      clearTimeout(timeout);
       const data = await resp.json();
       if (!data.ok) {
         throw new Error(data.error ?? "转文字失败");

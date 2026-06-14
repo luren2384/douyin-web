@@ -1,33 +1,30 @@
 import { NextRequest, NextResponse } from "next/server";
-import { spawn } from "child_process";
-import { tmpdir } from "os";
-import { join } from "path";
-import { writeFile, readFile, unlink, mkdir } from "fs/promises";
+import { S3Client, PutObjectCommand, DeleteObjectCommand } from "@aws-sdk/client-s3";
 import { randomUUID } from "crypto";
 import { DEFAULT_UA } from "@/lib/douyin-parser";
 
-// 系统安装的 ffmpeg 绝对路径（winget 安装位置）
-const FFMPEG_PATH = "C:\\Users\\yuhan\\AppData\\Local\\Microsoft\\WinGet\\Packages\\Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe\\ffmpeg-8.1.1-full_build\\bin\\ffmpeg.exe";
+// 火山引擎 LAS API
+const LAS_BASE = "https://operator.las.cn-beijing.volces.com/api/v1";
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 300;
 
 /**
- * 视频转文字接口
+ * 视频转文字接口（火山引擎 LAS + Cloudflare R2 方案）
  *
  * 流程：
- * 1. 服务端下载抖音视频（带 Referer 绕过 403）
- * 2. 用 ffmpeg 提取音频为 mp3（大幅减小体积，确保在扣子 10MB 限制内）
- * 3. 上传 mp3 到扣子 ASR（/v1/audio/transcriptions）转文字
- * 4. 调用扣子大模型对转写文字智能分段（类似讯飞听见的段落效果）
+ * 1. 服务端下载视频（带 Referer 绕过抖音 CDN 403）
+ * 2. 上传视频到 Cloudflare R2（公开可访问）
+ * 3. 把 R2 公开 URL 传给火山引擎 LAS（las_asr_pro）转写
+ * 4. 轮询任务结果
+ * 5. 清理 R2 临时文件
+ * 6. 对结果文字智能分段
  *
  * 请求体: { video_url: string }
  * 返回: { ok: boolean, text?: string, error?: string }
  */
 export async function POST(request: NextRequest) {
-  const tmpDir = join(tmpdir(), "douyin-transcribe");
-  let tmpVideoPath = "";
-  let tmpAudioPath = "";
+  const r2Key = `tmp/${randomUUID()}.mp4`;
 
   try {
     const body = await request.json();
@@ -40,20 +37,16 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    const cozeToken = process.env.COZE_WORKLOAD_API_TOKEN;
-    if (!cozeToken) {
+    const lasKey = process.env.LAS_DEFAULT_API_KEY;
+    if (!lasKey) {
       return NextResponse.json(
-        { ok: false, error: "未配置 COZE_WORKLOAD_API_TOKEN" },
+        { ok: false, error: "未配置 LAS_DEFAULT_API_KEY" },
         { status: 500 }
       );
     }
 
-    await mkdir(tmpDir, { recursive: true });
-    const jobId = randomUUID();
-    tmpVideoPath = join(tmpDir, `${jobId}.mp4`);
-    tmpAudioPath = join(tmpDir, `${jobId}.mp3`);
-
     // 第一步：下载视频（带 Referer 绕过抖音 CDN 403）
+    console.log("[transcribe] 正在下载视频...");
     const videoResp = await fetch(videoUrl, {
       headers: {
         "User-Agent": DEFAULT_UA,
@@ -74,56 +67,25 @@ export async function POST(request: NextRequest) {
     }
 
     const videoBuffer = Buffer.from(await videoResp.arrayBuffer());
-    await writeFile(tmpVideoPath, videoBuffer);
+    console.log(`[transcribe] 视频下载完成: ${(videoBuffer.length / 1024 / 1024).toFixed(2)} MB`);
 
-    // 第二步：ffmpeg 提取音频为 mp3（64kbps/16kHz/单声道，语音识别足够）
-    await extractAudio(tmpVideoPath, tmpAudioPath);
-    const audioBuffer = await readFile(tmpAudioPath);
-    console.log(`[transcribe] 音频大小: ${(audioBuffer.length / 1024 / 1024).toFixed(2)} MB`);
+    // 第二步：上传到 R2
+    console.log("[transcribe] 正在上传到 R2...");
+    const publicUrl = await uploadToR2(videoBuffer, r2Key);
+    console.log(`[transcribe] R2 上传完成: ${publicUrl}`);
 
-    // 第三步：上传音频到扣子 ASR
-    const formData = new FormData();
-    const audioBlob = new Blob([audioBuffer], { type: "audio/mp3" });
-    formData.append("file", audioBlob, "audio.mp3");
+    // 第三步：提交 LAS ASR 任务
+    const taskId = await submitAsrTask(lasKey, publicUrl);
+    console.log(`[transcribe] LAS 任务已提交: ${taskId}`);
 
-    const asrResp = await fetch("https://api.coze.cn/v1/audio/transcriptions", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${cozeToken}`,
-      },
-      body: formData,
-      signal: AbortSignal.timeout(120000),
-    });
-
-    if (!asrResp.ok) {
-      const errText = await asrResp.text().catch(() => "");
-      return NextResponse.json(
-        {
-          ok: false,
-          error: `扣子 ASR 请求失败(${asrResp.status}): ${errText.slice(0, 200)}`,
-        },
-        { status: 502 }
-      );
-    }
-
-    const asrData = await asrResp.json();
-
-    if (asrData.code !== 0) {
-      return NextResponse.json(
-        {
-          ok: false,
-          error: `语音识别失败: ${asrData.msg ?? "未知错误"}`,
-        },
-        { status: 502 }
-      );
-    }
-
-    const rawText = asrData.data?.text ?? "";
+    // 第四步：轮询任务结果
+    const rawText = await pollAsrResult(lasKey, taskId);
     console.log(`[transcribe] ASR 转写完成, 文字长度: ${rawText.length}`);
 
-    // 第四步：智能分段（类似讯飞听见的段落效果）
+    // 第五步：智能分段
     const text = formatParagraphs(rawText);
-    console.log(`[transcribe] 智能分段完成`);
+    console.log("[transcribe] 智能分段完成");
+
     return NextResponse.json({ ok: true, text });
   } catch (err: any) {
     console.error("[transcribe] 错误:", err);
@@ -132,104 +94,202 @@ export async function POST(request: NextRequest) {
       { status: 500 }
     );
   } finally {
-    // 清理临时文件
-    for (const p of [tmpVideoPath, tmpAudioPath]) {
-      if (p) await unlink(p).catch(() => {});
-    }
+    // 清理 R2 临时文件
+    await deleteFromR2(r2Key).catch(() => {});
   }
 }
 
 /**
+ * 上传文件到 Cloudflare R2，返回公开访问 URL
+ */
+async function uploadToR2(buffer: Buffer, key: string): Promise<string> {
+  const client = new S3Client({
+    region: "auto",
+    endpoint: process.env.R2_ENDPOINT!,
+    credentials: {
+      accessKeyId: process.env.R2_ACCESS_KEY_ID!,
+      secretAccessKey: process.env.R2_SECRET_ACCESS_KEY!,
+    },
+  });
+
+  await client.send(
+    new PutObjectCommand({
+      Bucket: process.env.R2_BUCKET_NAME!,
+      Key: key,
+      Body: buffer,
+      ContentType: "video/mp4",
+    })
+  );
+
+  return `${process.env.R2_PUBLIC_URL}/${key}`;
+}
+
+/**
+ * 从 R2 删除临时文件
+ */
+async function deleteFromR2(key: string): Promise<void> {
+  const client = new S3Client({
+    region: "auto",
+    endpoint: process.env.R2_ENDPOINT!,
+    credentials: {
+      accessKeyId: process.env.R2_ACCESS_KEY_ID!,
+      secretAccessKey: process.env.R2_SECRET_ACCESS_KEY!,
+    },
+  });
+
+  await client.send(
+    new DeleteObjectCommand({
+      Bucket: process.env.R2_BUCKET_NAME!,
+      Key: key,
+    })
+  );
+  console.log(`[transcribe] R2 临时文件已清理: ${key}`);
+}
+
+/**
+ * 提交 LAS ASR 任务（las_asr_pro 增强版）
+ */
+async function submitAsrTask(apiKey: string, videoUrl: string): Promise<string> {
+  const resp = await fetch(`${LAS_BASE}/submit`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify({
+      operator_id: "las_asr_pro",
+      operator_version: "v1",
+      data: {
+        resource: "bigasr",
+        audio: {
+          url: videoUrl,
+          format: "wav",
+        },
+        request: {
+          model_name: "bigmodel",
+          enable_itn: true,
+          enable_punc: true,
+        },
+      },
+    }),
+    signal: AbortSignal.timeout(30000),
+  });
+
+  const data = await resp.json();
+
+  if (!resp.ok) {
+    throw new Error(`LAS 提交失败(${resp.status}): ${JSON.stringify(data).slice(0, 300)}`);
+  }
+
+  if (data.metadata?.task_status !== "ACCEPTED" && data.metadata?.task_status !== "PENDING") {
+    throw new Error(
+      `LAS 任务未被接受: ${data.metadata?.error_msg ?? JSON.stringify(data).slice(0, 200)}`
+    );
+  }
+
+  return data.metadata.task_id;
+}
+
+/**
+ * 轮询 LAS ASR 任务结果
+ */
+async function pollAsrResult(apiKey: string, taskId: string): Promise<string> {
+  const maxAttempts = 90;
+  const interval = 2000; // 每 2 秒轮询一次
+
+  for (let i = 0; i < maxAttempts; i++) {
+    await sleep(interval);
+
+    const resp = await fetch(`${LAS_BASE}/poll`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify({
+        operator_id: "las_asr_pro",
+        operator_version: "v1",
+        task_id: taskId,
+      }),
+      signal: AbortSignal.timeout(30000),
+    });
+
+    const data = await resp.json();
+
+    if (!resp.ok) {
+      throw new Error(`LAS 轮询失败(${resp.status}): ${JSON.stringify(data).slice(0, 300)}`);
+    }
+
+    const status = data.metadata?.task_status;
+    console.log(`[transcribe] 轮询 ${i + 1}/${maxAttempts}: ${status}`);
+
+    if (status === "COMPLETED") {
+      const result = data.data?.result;
+      if (typeof result === "string") {
+        return result;
+      }
+      if (result?.text) {
+        return result.text;
+      }
+      if (Array.isArray(result)) {
+        return result.map((item: any) => item.text ?? "").join("");
+      }
+      return JSON.stringify(result ?? "");
+    }
+
+    if (status === "FAILED") {
+      throw new Error(`LAS 任务失败: ${data.metadata?.error_msg ?? "未知错误"}`);
+    }
+  }
+
+  throw new Error("LAS 任务超时（5 分钟内未完成）");
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
  * 智能分段（类似讯飞听见的段落效果）
- *
- * 策略：
- * 1. 先按句号、问号、感叹号切分成句子
- * 2. 把句子累积成段落，当段落字数达到阈值（约 80-150 字）时断段
- * 3. 遇到明显的语义转折词（如"第X名"）也断段
- * 4. 每段以换行符分隔
  */
 function formatParagraphs(rawText: string): string {
-  // 去除多余空白
   const cleanText = rawText.replace(/\s+/g, " ").trim();
   if (!cleanText) return "";
 
-  // 按句末标点切分（保留标点）
-  const sentences = cleanText.match(/[^。？！\.\?!]+[。？！\.\?!]*/g) || [cleanText];
+  const sentences =
+    cleanText.match(/[^。？！\.\?!]+[。？！\.\?!]*/g) || [cleanText];
 
   const paragraphs: string[] = [];
   let currentPara = "";
 
-  // 语义转折关键词：遇到这些词在句首时，强制开启新段落
   const breakKeywords = /^第[一二三四五六七八九十百0-9]+[名条步个章节]/;
 
   for (const sentence of sentences) {
     const trimmed = sentence.trim();
     if (!trimmed) continue;
 
-    // 如果当前段落为空，直接加入
     if (!currentPara) {
       currentPara = trimmed;
       continue;
     }
 
-    // 遇到转折关键词，强制断段
     if (breakKeywords.test(trimmed)) {
       paragraphs.push(currentPara);
       currentPara = trimmed;
       continue;
     }
 
-    // 累积到段落中
     currentPara += trimmed;
 
-    // 段落字数达到阈值时断段（80-150 字之间）
     if (currentPara.length >= 80) {
       paragraphs.push(currentPara);
       currentPara = "";
     }
   }
 
-  // 最后一段
   if (currentPara) {
     paragraphs.push(currentPara);
   }
 
   return paragraphs.join("\n\n");
-}
-
-/**
- * 用 ffmpeg 从视频中提取音频为 mp3
- */
-function extractAudio(videoPath: string, audioPath: string): Promise<void> {
-  return new Promise((resolve, reject) => {
-    console.log("[ffmpeg] 使用路径:", FFMPEG_PATH);
-
-    const proc = spawn(FFMPEG_PATH, [
-      "-i", videoPath,
-      "-vn",
-      "-acodec", "libmp3lame",
-      "-ab", "64k",
-      "-ar", "16000",
-      "-ac", "1",
-      "-y",
-      audioPath,
-    ]);
-
-    let stderr = "";
-    proc.stderr.on("data", (data) => {
-      stderr += data.toString();
-    });
-
-    proc.on("close", (code) => {
-      if (code === 0) {
-        resolve();
-      } else {
-        reject(new Error(`ffmpeg 提取音频失败(exit ${code}): ${stderr.slice(-500)}`));
-      }
-    });
-
-    proc.on("error", (err) => {
-      reject(new Error(`ffmpeg 启动失败: ${err.message}`));
-    });
-  });
 }
