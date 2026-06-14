@@ -58,3 +58,29 @@ export function removeVideo(awemeId: string): void {
   const list = getSavedVideos().filter((v) => v.aweme_id !== awemeId);
   localStorage.setItem(STORAGE_KEY, JSON.stringify(list));
 }
+
+/** 批量保存视频（去重） */
+export function saveVideos(videos: SavedVideo[]): void {
+  if (typeof window === "undefined") return;
+  const list = getSavedVideos();
+  for (const video of videos) {
+    const idx = list.findIndex((v) => v.aweme_id === video.aweme_id);
+    if (idx >= 0) {
+      list[idx] = { ...list[idx], ...video };
+    } else {
+      list.unshift(video);
+    }
+  }
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(list));
+}
+
+/** 批量清空转写记录 */
+export function clearAllTranscripts(): void {
+  if (typeof window === "undefined") return;
+  const list = getSavedVideos();
+  for (const v of list) {
+    delete v.transcript;
+    delete v.transcribed_at;
+  }
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(list));
+}
