@@ -19,6 +19,7 @@ export const maxDuration = 300;
  * 1. 服务端下载抖音视频（带 Referer 绕过 403）
  * 2. 用 ffmpeg 提取音频为 mp3（大幅减小体积，确保在扣子 10MB 限制内）
  * 3. 上传 mp3 到扣子 ASR（/v1/audio/transcriptions）转文字
+ * 4. 调用扣子大模型对转写文字智能分段（类似讯飞听见的段落效果）
  *
  * 请求体: { video_url: string }
  * 返回: { ok: boolean, text?: string, error?: string }
@@ -117,8 +118,12 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    const text = asrData.data?.text ?? "";
-    console.log(`[transcribe] 转写完成, 文字长度: ${text.length}`);
+    const rawText = asrData.data?.text ?? "";
+    console.log(`[transcribe] ASR 转写完成, 文字长度: ${rawText.length}`);
+
+    // 第四步：智能分段（类似讯飞听见的段落效果）
+    const text = formatParagraphs(rawText);
+    console.log(`[transcribe] 智能分段完成`);
     return NextResponse.json({ ok: true, text });
   } catch (err: any) {
     console.error("[transcribe] 错误:", err);
@@ -132,6 +137,64 @@ export async function POST(request: NextRequest) {
       if (p) await unlink(p).catch(() => {});
     }
   }
+}
+
+/**
+ * 智能分段（类似讯飞听见的段落效果）
+ *
+ * 策略：
+ * 1. 先按句号、问号、感叹号切分成句子
+ * 2. 把句子累积成段落，当段落字数达到阈值（约 80-150 字）时断段
+ * 3. 遇到明显的语义转折词（如"第X名"）也断段
+ * 4. 每段以换行符分隔
+ */
+function formatParagraphs(rawText: string): string {
+  // 去除多余空白
+  const cleanText = rawText.replace(/\s+/g, " ").trim();
+  if (!cleanText) return "";
+
+  // 按句末标点切分（保留标点）
+  const sentences = cleanText.match(/[^。？！\.\?!]+[。？！\.\?!]*/g) || [cleanText];
+
+  const paragraphs: string[] = [];
+  let currentPara = "";
+
+  // 语义转折关键词：遇到这些词在句首时，强制开启新段落
+  const breakKeywords = /^第[一二三四五六七八九十百0-9]+[名条步个章节]/;
+
+  for (const sentence of sentences) {
+    const trimmed = sentence.trim();
+    if (!trimmed) continue;
+
+    // 如果当前段落为空，直接加入
+    if (!currentPara) {
+      currentPara = trimmed;
+      continue;
+    }
+
+    // 遇到转折关键词，强制断段
+    if (breakKeywords.test(trimmed)) {
+      paragraphs.push(currentPara);
+      currentPara = trimmed;
+      continue;
+    }
+
+    // 累积到段落中
+    currentPara += trimmed;
+
+    // 段落字数达到阈值时断段（80-150 字之间）
+    if (currentPara.length >= 80) {
+      paragraphs.push(currentPara);
+      currentPara = "";
+    }
+  }
+
+  // 最后一段
+  if (currentPara) {
+    paragraphs.push(currentPara);
+  }
+
+  return paragraphs.join("\n\n");
 }
 
 /**
