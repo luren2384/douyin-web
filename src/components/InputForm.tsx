@@ -24,14 +24,14 @@ export default function InputForm({ onBatchResult }: Props) {
     e.preventDefault();
 
     // 按行分割，去重，过滤空行
-    const urls = [
-      ...new Set(
+    const urls = Array.from(
+      new Set(
         text
           .split("\n")
           .map((s) => s.trim())
           .filter((s) => s.length > 0)
-      ),
-    ];
+      )
+    );
 
     if (urls.length === 0) {
       setError("请输入至少一个抖音分享链接");
